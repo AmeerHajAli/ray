@@ -13,11 +13,11 @@ import collections
 
 from ray.experimental.internal_kv import _internal_kv_put, \
     _internal_kv_initialized
-from ray.autoscaler.tags import (TAG_RAY_LAUNCH_CONFIG, TAG_RAY_RUNTIME_CONFIG,
-                                 TAG_RAY_FILE_MOUNTS_CONTENTS,
-                                 TAG_RAY_NODE_STATUS, TAG_RAY_NODE_KIND,
-                                 TAG_RAY_USER_NODE_TYPE, STATUS_UP_TO_DATE,
-                                 NODE_KIND_WORKER, NODE_KIND_UNMANAGED)
+from ray.autoscaler.tags import (
+    TAG_RAY_LAUNCH_CONFIG, TAG_RAY_RUNTIME_CONFIG,
+    TAG_RAY_FILE_MOUNTS_CONTENTS, TAG_RAY_NODE_STATUS, TAG_RAY_NODE_KIND,
+    TAG_RAY_USER_NODE_TYPE, STATUS_UP_TO_DATE, NODE_KIND_WORKER,
+    NODE_KIND_UNMANAGED, STATUS_UPDATE_FAILED)
 from ray.autoscaler._private.providers import _get_node_provider
 from ray.autoscaler._private.updater import NodeUpdaterThread
 from ray.autoscaler._private.node_launcher import NodeLauncher
@@ -72,6 +72,11 @@ class StandardAutoscaler:
         # exactly once).
         self.provider = None
         self.resource_demand_scheduler = None
+        # A dict for non terminated nodes that didnt show up in load_metrics.
+        # The values for every node id are the times each node was captured
+        # outside load_metrics.
+        self.heartbeatless_nodes: Dict[NodeID, float] = {}
+
         self.reset(errors_fatal=True)
         self.head_node_ip = load_metrics.local_ip
         self.load_metrics = load_metrics
@@ -164,27 +169,47 @@ class StandardAutoscaler:
         last_used = self.load_metrics.last_used_time_by_ip
         horizon = now - (60 * self.config["idle_timeout_minutes"])
 
+        self.heartbeatless_nodes = self._update_heartbeatless_nodes(
+            nodes, last_used.keys())
+
         nodes_to_terminate = []
         node_type_counts = collections.defaultdict(int)
         # Sort based on last used to make sure to keep min_workers that
         # were most recently used. Otherwise, _keep_min_workers_of_node_type
         # might keep a node that should be terminated.
         for node_id in self._sort_based_on_last_used(nodes, last_used):
-            # Make sure to not kill idle node types if the number of workers
-            # of that type is lower/equal to the min_workers of that type.
-            if self._keep_min_worker_of_node_type(
-                    node_id,
-                    node_type_counts) and self.launch_config_ok(node_id):
-                continue
+            # Update node_type_counts to keep idle workers when respecting
+            # min_workers constraint.
+            tags = self.provider.node_tags(node_id)
+            if TAG_RAY_USER_NODE_TYPE in tags:
+                node_type = tags[TAG_RAY_USER_NODE_TYPE]
+                node_type_counts[node_type] += 1
+
+            is_failed_node = tags.get(TAG_RAY_NODE_STATUS) == \
+                STATUS_UPDATE_FAILED
 
             node_ip = self.provider.internal_ip(node_id)
-            if node_ip in last_used and last_used[node_ip] < horizon:
+            if (node_ip in last_used and last_used[node_ip] < horizon and
+                    # Make sure to not kill idle node types if the number of
+                    # workers of that type is lower/equal to the min_workers of
+                    # that type.
+                    not self._keep_min_worker_of_node_type(
+                        node_id, node_type_counts)):
                 logger.info("StandardAutoscaler: "
-                            "{}: Terminating idle node".format(node_id))
+                            "{}: Terminating idle node.".format(node_id))
                 nodes_to_terminate.append(node_id)
             elif not self.launch_config_ok(node_id):
                 logger.info("StandardAutoscaler: "
-                            "{}: Terminating outdated node".format(node_id))
+                            "{}: Terminating outdated node.".format(node_id))
+                nodes_to_terminate.append(node_id)
+            elif self.terminate_failed_nodes and \
+                    node_id in self.heartbeatless_nodes and \
+                    self.heartbeatless_nodes[node_id] < horizon:
+                logger.info("StandardAutoscaler: "
+                            f"{node_id}: Terminating failed node. "
+                            "To not terminate failed nodes, set "
+                            "terminate_failed_nodes in cluster config to "
+                            "False.")
                 nodes_to_terminate.append(node_id)
 
         if nodes_to_terminate:
@@ -262,6 +287,23 @@ class StandardAutoscaler:
         for node_id in nodes:
             self.recover_if_needed(node_id, now)
 
+    def _update_heartbeatless_nodes(
+            self, non_terminated_worker_nodes: List[NodeID],
+            last_used_node_ips: List[str]) -> Dict[NodeID, float]:
+        heartbeatless_nodes = [
+            node_id for node_id in non_terminated_worker_nodes
+            if self.provider.internal_ip(node_id) not in last_used_node_ips
+        ]
+        heartbeatless_nodes_dict = {}
+        for node_id in heartbeatless_nodes:
+            if node_id in self.heartbeatless_nodes:
+                heartbeatless_nodes_dict[node_id] = self.heartbeatless_nodes[
+                    node_id]
+            else:
+                heartbeatless_nodes_dict[node_id] = time.time()
+
+        return heartbeatless_nodes_dict
+
     def _sort_based_on_last_used(self, nodes: List[NodeID],
                                  last_used: Dict[str, float]) -> List[NodeID]:
         """Sort the nodes based on the last time they were used.
@@ -286,8 +328,7 @@ class StandardAutoscaler:
         """Returns if workers of node_type should be terminated.
 
         Receives the counters of running nodes so far and determines if idle
-        node_id should be terminated or not. It also updates the counters
-        (node_type_counts), which is returned by reference.
+        node_id should be terminated or not.
 
         Args:
             node_type_counts(Dict[NodeType, int]): The non_terminated node
@@ -298,7 +339,6 @@ class StandardAutoscaler:
         tags = self.provider.node_tags(node_id)
         if TAG_RAY_USER_NODE_TYPE in tags:
             node_type = tags[TAG_RAY_USER_NODE_TYPE]
-            node_type_counts[node_type] += 1
             min_workers = self.available_node_types[node_type].get(
                 "min_workers", 0)
             max_workers = self.available_node_types[node_type].get(
@@ -319,6 +359,7 @@ class StandardAutoscaler:
 
     def reset(self, errors_fatal=False):
         sync_continuously = False
+        self.terminate_failed_nodes = True
         if hasattr(self, "config"):
             sync_continuously = self.config.get(
                 "file_mounts_sync_continuously", False)
@@ -347,6 +388,8 @@ class StandardAutoscaler:
                  generate_file_mounts_contents_hash=sync_continuously,
              )
             self.config = new_config
+            self.terminate_failed_nodes = self.config.get(
+                "terminate_failed_nodes", True)
             self.runtime_hash = new_runtime_hash
             self.file_mounts_contents_hash = new_file_mounts_contents_hash
             if not self.provider:

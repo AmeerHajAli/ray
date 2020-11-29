@@ -70,6 +70,10 @@ worker_nodes:
 
 idle_timeout_minutes: 2
 
+# If enabled, nodes that fail to launch are terminated after idle timeout.
+# Enabled by default.
+terminate_failed_nodes: True
+
 # How Ray will authenticate with newly launched nodes.
 auth:
     ssh_user: ubuntu

@@ -115,3 +115,7 @@ worker_default_node_type: cpu_4_spot
 #worker_nodes:
 
 idle_timeout_minutes: 5
+
+# If enabled, nodes that fail to launch are terminated after idle timeout.
+# Enabled by default.
+terminate_failed_nodes: True

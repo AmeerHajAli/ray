@@ -274,6 +274,10 @@
             "type": "array",
             "description": "List of paths on the head node which should sync to the worker nodes, e.g. [\"/some/data/somehwere\"]"
         },
+        "terminate_failed_nodes": {
+            "type": "boolean",
+            "description": "Enabled by default. If enabled, nodes that fail to launch are terminated after idle timeout."
+        },
         "file_mounts_sync_continuously": {
             "type": "boolean",
             "description": "If enabled, file mounts will sync continously between the head node and the worker nodes. The nodes will not re-run setup commands if only the contents of the file mounts folders change."

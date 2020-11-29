@@ -23,6 +23,10 @@ docker: {}
 # If a node is idle for this many minutes, it will be removed.
 idle_timeout_minutes: 5
 
+# If enabled, nodes that fail to launch are terminated after idle timeout.
+# Enabled by default.
+terminate_failed_nodes: True
+
 # Cloud-provider specific configuration.
 provider:
     type: aws

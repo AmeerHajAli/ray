@@ -21,6 +21,10 @@ upscaling_speed: 1.0
 
 idle_timeout_minutes: 5
 
+# If enabled, nodes that fail to launch are terminated after idle timeout.
+# Enabled by default.
+terminate_failed_nodes: True
+
 # This executes all commands on all nodes in the docker container,
 # and opens all the necessary ports to support the Ray cluster.
 # Empty string means disabled. Assumes Docker is installed.
