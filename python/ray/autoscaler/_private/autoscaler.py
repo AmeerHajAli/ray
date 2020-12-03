@@ -72,11 +72,6 @@ class StandardAutoscaler:
         # exactly once).
         self.provider = None
         self.resource_demand_scheduler = None
-        # A dict for non terminated nodes that didnt show up in load_metrics.
-        # The values for every node id are the times each node was captured
-        # outside load_metrics.
-        self.heartbeatless_nodes: Dict[NodeID, float] = {}
-
         self.reset(errors_fatal=True)
         self.head_node_ip = load_metrics.local_ip
         self.load_metrics = load_metrics
@@ -169,9 +164,6 @@ class StandardAutoscaler:
         last_used = self.load_metrics.last_used_time_by_ip
         horizon = now - (60 * self.config["idle_timeout_minutes"])
 
-        self.heartbeatless_nodes = self._update_heartbeatless_nodes(
-            nodes, last_used.keys())
-
         nodes_to_terminate = []
         node_type_counts = collections.defaultdict(int)
         # Sort based on last used to make sure to keep min_workers that
@@ -184,9 +176,6 @@ class StandardAutoscaler:
             if TAG_RAY_USER_NODE_TYPE in tags:
                 node_type = tags[TAG_RAY_USER_NODE_TYPE]
                 node_type_counts[node_type] += 1
-
-            is_failed_node = tags.get(TAG_RAY_NODE_STATUS) == \
-                STATUS_UPDATE_FAILED
 
             node_ip = self.provider.internal_ip(node_id)
             if (node_ip in last_used and last_used[node_ip] < horizon and
@@ -201,15 +190,6 @@ class StandardAutoscaler:
             elif not self.launch_config_ok(node_id):
                 logger.info("StandardAutoscaler: "
                             "{}: Terminating outdated node.".format(node_id))
-                nodes_to_terminate.append(node_id)
-            elif self.terminate_failed_nodes and \
-                    node_id in self.heartbeatless_nodes and \
-                    self.heartbeatless_nodes[node_id] < horizon:
-                logger.info("StandardAutoscaler: "
-                            f"{node_id}: Terminating failed node. "
-                            "To not terminate failed nodes, set "
-                            "terminate_failed_nodes in cluster config to "
-                            "False.")
                 nodes_to_terminate.append(node_id)
 
         if nodes_to_terminate:
@@ -229,7 +209,6 @@ class StandardAutoscaler:
         if nodes_to_terminate:
             self.provider.terminate_nodes(nodes_to_terminate)
             nodes = self.workers()
-
             self.log_info_string(nodes)
 
         to_launch = self.resource_demand_scheduler.get_nodes_to_launch(
@@ -247,6 +226,7 @@ class StandardAutoscaler:
 
         # Process any completed updates
         completed = []
+        failed_nodes_to_terminate = []
         for node_id, updater in self.updaters.items():
             if not updater.is_alive():
                 completed.append(node_id)
@@ -256,12 +236,31 @@ class StandardAutoscaler:
                     self.num_successful_updates[node_id] += 1
                 else:
                     self.num_failed_updates[node_id] += 1
+                    failed_nodes_to_terminate.append(node_id)
                 del self.updaters[node_id]
             # Mark the node as active to prevent the node recovery logic
             # immediately trying to restart Ray on the new node.
             self.load_metrics.mark_active(self.provider.internal_ip(node_id))
             nodes = self.workers()
             self.log_info_string(nodes)
+        import pdb; pdb.set_trace()
+        if self.terminate_failed_nodes and failed_nodes_to_terminate:
+            for node_id in failed_nodes_to_terminate:
+                tags = self.provider.node_tags(node_id)
+                node_type = tags.get(TAG_RAY_USER_NODE_TYPE, "N/A")
+                logger.info("StandardAutoscaler: "
+                            f"{node_id}: Terminating failed to setup/update "
+                            f"node of node type {node_type}. To not terminate "
+                            "failed nodes, set terminate_failed_nodes in "
+                            "cluster config to False.")
+            self.provider.terminate_nodes(failed_nodes_to_terminate)
+            nodes = self.workers()
+            self.log_info_string(nodes)
+            self.num_failures = self.num_failures + len(
+                failed_nodes_to_terminate)
+            if self.num_failures > self.max_failures:
+                raise Exception("StandardAutoscaler: "
+                                "Too many errors while updating worker nodes.")
 
         # Update nodes with out-of-date files.
         # TODO(edoakes): Spawning these threads directly seems to cause
@@ -286,23 +285,6 @@ class StandardAutoscaler:
         # Attempt to recover unhealthy nodes
         for node_id in nodes:
             self.recover_if_needed(node_id, now)
-
-    def _update_heartbeatless_nodes(
-            self, non_terminated_worker_nodes: List[NodeID],
-            last_used_node_ips: List[str]) -> Dict[NodeID, float]:
-        heartbeatless_nodes = [
-            node_id for node_id in non_terminated_worker_nodes
-            if self.provider.internal_ip(node_id) not in last_used_node_ips
-        ]
-        heartbeatless_nodes_dict = {}
-        for node_id in heartbeatless_nodes:
-            if node_id in self.heartbeatless_nodes:
-                heartbeatless_nodes_dict[node_id] = self.heartbeatless_nodes[
-                    node_id]
-            else:
-                heartbeatless_nodes_dict[node_id] = time.time()
-
-        return heartbeatless_nodes_dict
 
     def _sort_based_on_last_used(self, nodes: List[NodeID],
                                  last_used: Dict[str, float]) -> List[NodeID]:
